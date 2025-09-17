@@ -1,0 +1,11 @@
+seed: 42
+max_examples_per_source: 70000  
+sources:
+  - name: nutanix_code_suggestions
+    type: nutanix
+    args:
+      data_file: code_suggestions.csv
+prepare:
+  train_ratio: 0.9
+  max_examples_final: 50000      
+  max_response_chars: 300
