@@ -7,10 +7,12 @@ from src.config import SEED, MAX_EXAMPLES_PER_SOURCE, RAW_DATA_DIR, DEFAULT_DATA
 
 
 from .sources.nutanix import fetch_nutanix_code_suggestions
+from .sources.kaggle_code_review_v2 import fetch_kaggle_code_review_v2 
 
 
 FETCHERS: Dict[str, Callable[..., List[RawRecord]]] = {
     "nutanix": fetch_nutanix_code_suggestions,
+     "kaggle_code_review_v2": fetch_kaggle_code_review_v2,
 }
 
 
