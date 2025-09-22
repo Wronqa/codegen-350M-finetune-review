@@ -5,6 +5,7 @@ import torch
 from typing import Dict, List
 from datasets import load_dataset, DatasetDict
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.trainer_utils import get_last_checkpoint
 from trl import SFTTrainer, SFTConfig
 from peft import LoraConfig, get_peft_model
 from utils.mlflow import start_run, log_params, log_metrics, MlflowStepLogger
@@ -48,6 +49,14 @@ def _load_tokenizer() -> AutoTokenizer:
         tok.pad_token = tok.eos_token
         tok.pad_token_id = tok.eos_token_id
     return tok
+
+
+def _get_last_ckpt_dir(output_dir: str) -> str | None:
+    try:
+        ckpt = get_last_checkpoint(output_dir)
+        return ckpt
+    except Exception:
+        return None
 
 def _load_base_model() -> AutoModelForCausalLM:
     dtype = torch.float16 if FP16 and torch.cuda.is_available() else torch.float32
@@ -98,6 +107,10 @@ def _build_sft_config() -> SFTConfig:
         seed=SEED,
         report_to=[],     
         packing=PACKING,
+        load_best_model_at_end=False,     
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        save_safetensors=True,
     )
 
 def _build_trainer(model, tok, ds_fmt: DatasetDict) -> SFTTrainer:
@@ -146,6 +159,12 @@ def main() -> None:
     lora_model = _build_lora_model(base)
 
     trainer = _build_trainer(lora_model, tok, ds_fmt)
+
+    last_ckpt = _get_last_ckpt_dir(str(ADAPTERS_DIR))
+    if last_ckpt:
+        print(f"[resume] Found checkpoint: {last_ckpt} -> resuming training from it.")
+    else:
+        print("[resume] No checkpoint found. Starting fresh training.")
 
     run_name = "codegen350m_lora_train"
     with start_run(run_name=run_name, experiment=MLFLOW_TRAIN_EXPERIMENT_NAME):
