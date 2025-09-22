@@ -5,6 +5,11 @@ sources:
     type: nutanix
     args:
       data_file: code_suggestions.csv
+  - name: kaggle_code_review_v2
+    type: kaggle_code_review_v2
+    args:
+      dataset: "bulivington/code-review-data-v2"
+      filename: "code_review_data.csv"
 prepare:
   train_ratio: 0.9
   max_examples_final: 50000      
