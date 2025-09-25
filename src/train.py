@@ -8,7 +8,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.trainer_utils import get_last_checkpoint
 from trl import SFTTrainer, SFTConfig
 from peft import LoraConfig, get_peft_model
-from utils.mlflow import start_run, log_params, log_metrics, MlflowStepLogger
+import mlflow 
+from mlflow.tracking import MlflowClient
+
+from utils.mlflow import log_params, log_metrics, MlflowStepLogger
 
 from config import (
     TRAIN_PATH, VAL_PATH, ADAPTERS_DIR,
@@ -17,26 +20,29 @@ from config import (
     PADDING_SIDE, TRUNCATION_SIDE, MLFLOW_TRAIN_EXPERIMENT_NAME
 )
 
+RUN_ID_FILE = os.path.join(ADAPTERS_DIR, "run_id.txt")
+
+
 def _ensure_dirs() -> None:
     os.makedirs(ADAPTERS_DIR, exist_ok=True)
+
 
 def _load_dataset() -> DatasetDict:
     data_files = {"train": str(TRAIN_PATH), "validation": str(VAL_PATH)}
     ds = load_dataset("json", data_files=data_files)
-
     for split in ("train", "validation"):
-        cols = set(ds[split].column_names)
-        if not {"prompt", "response"}.issubset(cols):
-            missing = {"prompt", "response"} - cols
+        required = {"prompt", "response"}
+        if not required.issubset(ds[split].column_names):
+            missing = required - set(ds[split].column_names)
             raise ValueError(f"{split} missing columns: {missing}")
     return ds
 
+
 def _format_examples(ds: DatasetDict, sep: str = "\n\n### Response:\n") -> DatasetDict:
     def to_text(example):
-        prompt = example["prompt"]
-        resp = example["response"]
-        return {"text": f"{prompt}{sep}{resp}"}
+        return {"text": f"{example['prompt']}{sep}{example['response']}"}
     return ds.map(to_text, remove_columns=ds["train"].column_names)
+
 
 def _load_tokenizer() -> AutoTokenizer:
     tok = AutoTokenizer.from_pretrained(
@@ -53,10 +59,10 @@ def _load_tokenizer() -> AutoTokenizer:
 
 def _get_last_ckpt_dir(output_dir: str) -> str | None:
     try:
-        ckpt = get_last_checkpoint(output_dir)
-        return ckpt
+        return get_last_checkpoint(output_dir)
     except Exception:
         return None
+
 
 def _load_base_model() -> AutoModelForCausalLM:
     dtype = torch.float16 if FP16 and torch.cuda.is_available() else torch.float32
@@ -66,10 +72,12 @@ def _load_base_model() -> AutoModelForCausalLM:
         device_map="auto",
     )
     if hasattr(model.config, "use_cache"):
-        model.config.use_cache = False  
+        model.config.use_cache = False
     return model
 
+
 FIXED_LORA_TARGETS: List[str] = ["q_proj", "k_proj", "v_proj", "out_proj", "fc_in", "fc_out"]
+
 
 def _build_lora_model(model: AutoModelForCausalLM) -> AutoModelForCausalLM:
     lora_cfg = LoraConfig(
@@ -84,6 +92,7 @@ def _build_lora_model(model: AutoModelForCausalLM) -> AutoModelForCausalLM:
     peft_model.print_trainable_parameters()
     return peft_model
 
+
 def _build_sft_config() -> SFTConfig:
     return SFTConfig(
         output_dir=str(ADAPTERS_DIR),
@@ -94,7 +103,7 @@ def _build_sft_config() -> SFTConfig:
         num_train_epochs=EPOCHS,
         logging_strategy="steps",
         logging_steps=LOGGING_STEPS,
-        evaluation_strategy="steps",
+        eval_strategy="steps",          
         eval_steps=EVAL_STEPS,
         save_strategy="steps",
         save_steps=SAVE_STEPS,
@@ -105,13 +114,16 @@ def _build_sft_config() -> SFTConfig:
         bf16=False,
         fp16=FP16,
         seed=SEED,
-        report_to=[],     
+        data_seed=SEED,
+        report_to=[],
         packing=PACKING,
-        load_best_model_at_end=False,     
+        load_best_model_at_end=False,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
         save_safetensors=True,
+        dataset_text_field="text",
     )
+
 
 def _build_trainer(model, tok, ds_fmt: DatasetDict) -> SFTTrainer:
     train_cfg = _build_sft_config()
@@ -122,10 +134,10 @@ def _build_trainer(model, tok, ds_fmt: DatasetDict) -> SFTTrainer:
         train_dataset=ds_fmt["train"],
         eval_dataset=ds_fmt["validation"],
         args=train_cfg,
-        dataset_text_field="text",
         callbacks=callbacks,
     )
     return trainer
+
 
 def _mlflow_hparams() -> Dict[str, object]:
     return {
@@ -148,6 +160,31 @@ def _mlflow_hparams() -> Dict[str, object]:
         "scheduler": LR_SCHEDULER,
     }
 
+
+def _validate_or_create_run(run_name: str) -> str:
+    mlflow.set_experiment(MLFLOW_TRAIN_EXPERIMENT_NAME)
+    client = MlflowClient()
+
+    if os.path.exists(RUN_ID_FILE):
+        run_id = open(RUN_ID_FILE, "r").read().strip()
+        try:
+            run = client.get_run(run_id)
+            if run.info.lifecycle_stage != "deleted":
+                print(f"[mlflow] Reusing existing run_id: {run_id}")
+                return run_id
+            else:
+                print(f"[mlflow] Stored run_id is deleted; creating a new one.")
+        except Exception:
+            print(f"[mlflow] Stored run_id not found; creating a new one.")
+
+    with mlflow.start_run(run_name=run_name) as run:
+        run_id = run.info.run_id
+        with open(RUN_ID_FILE, "w") as f:
+            f.write(run_id)
+        print(f"[mlflow] Created new run_id: {run_id} (saved to {RUN_ID_FILE})")
+        return run_id
+
+
 def main() -> None:
     _ensure_dirs()
 
@@ -161,16 +198,18 @@ def main() -> None:
     trainer = _build_trainer(lora_model, tok, ds_fmt)
 
     last_ckpt = _get_last_ckpt_dir(str(ADAPTERS_DIR))
-    if last_ckpt:
-        print(f"[resume] Found checkpoint: {last_ckpt} -> resuming training from it.")
-    else:
-        print("[resume] No checkpoint found. Starting fresh training.")
-
     run_name = "codegen350m_lora_train"
-    with start_run(run_name=run_name, experiment=MLFLOW_TRAIN_EXPERIMENT_NAME):
+    run_id = _validate_or_create_run(run_name)
+
+    with mlflow.start_run(run_id=run_id):
         log_params(_mlflow_hparams())
 
-        trainer.train()
+        if last_ckpt:
+            print(f"[resume] Found checkpoint: {last_ckpt} -> resuming training from it.")
+            trainer.train(resume_from_checkpoint=last_ckpt)
+        else:
+            print("[resume] No checkpoint found. Starting fresh training.")
+            trainer.train()
 
         eval_res = trainer.evaluate()
         final_metrics = {f"final_{k}": v for k, v in eval_res.items()}
@@ -179,6 +218,7 @@ def main() -> None:
     trainer.model.save_pretrained(str(ADAPTERS_DIR))
     tok.save_pretrained(str(ADAPTERS_DIR))
     print(f"LoRA adapter saved to: {ADAPTERS_DIR}")
+
 
 if __name__ == "__main__":
     main()
